@@ -78,9 +78,12 @@ type bestFastEncoder struct {
 
 	// Shards of the tables written since the last Reset with a dictionary.
 	// Reset copies back only these from the dictionary tables.
+	// Encode marks them only when markDirty is set, that is, after a Reset
+	// with a dictionary. Other writes make Reset copy all (allDirty).
 	tableShardDirty     [bestShortTableShardCnt]bool
 	longTableShardDirty [bestLongTableShardCnt]bool
 	allDirty            bool
+	markDirty           bool
 }
 
 // Encode improves compression...
@@ -144,6 +147,8 @@ func (e *bestFastEncoder) Encode(blk *blockEnc, src []byte) {
 		e.cur = e.maxMatchOff
 		break
 	}
+
+	markDirty := e.markDirty
 
 	// Add block to history
 	s := e.addBlock(src)
@@ -303,9 +308,11 @@ encodeLoop:
 		}
 		// Load next and check...
 		e.longTable[nextHashL] = prevEntry{offset: s + e.cur, prev: candidateL.offset}
-		e.longTableShardDirty[nextHashL>>dictShardBits] = true
 		e.table[nextHashS] = prevEntry{offset: s + e.cur, prev: candidateS.offset}
-		e.tableShardDirty[nextHashS>>dictShardBits] = true
+		if markDirty {
+			e.longTableShardDirty[nextHashL>>dictShardBits] = true
+			e.tableShardDirty[nextHashS>>dictShardBits] = true
+		}
 		index0 := s + 1
 
 		// Look far ahead, unless we have a really long match already...
@@ -400,9 +407,11 @@ encodeLoop:
 				h0 := hashLen(cv0, bestLongTableBits, bestLongLen)
 				h1 := hashLen(cv0, bestShortTableBits, bestShortLen)
 				e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
-				e.longTableShardDirty[h0>>dictShardBits] = true
 				e.table[h1] = prevEntry{offset: off, prev: e.table[h1].offset}
-				e.tableShardDirty[h1>>dictShardBits] = true
+				if markDirty {
+					e.longTableShardDirty[h0>>dictShardBits] = true
+					e.tableShardDirty[h1>>dictShardBits] = true
+				}
 				off++
 				index0++
 			}
@@ -462,9 +471,11 @@ encodeLoop:
 			h0 := hashLen(cv0, bestLongTableBits, bestLongLen)
 			h1 := hashLen(cv0, bestShortTableBits, bestShortLen)
 			e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
-			e.longTableShardDirty[h0>>dictShardBits] = true
 			e.table[h1] = prevEntry{offset: off, prev: e.table[h1].offset}
-			e.tableShardDirty[h1>>dictShardBits] = true
+			if markDirty {
+				e.longTableShardDirty[h0>>dictShardBits] = true
+				e.tableShardDirty[h1>>dictShardBits] = true
+			}
 			index0++
 			off++
 		}
@@ -497,6 +508,8 @@ func (e *bestFastEncoder) EncodeNoHist(blk *blockEnc, src []byte) {
 func (e *bestFastEncoder) Reset(d *dict, singleBlock bool) {
 	e.resetBase(d, singleBlock)
 	if d == nil {
+		e.markDirty = false
+		e.allDirty = true
 		return
 	}
 	dictChanged := d != e.lastDict
@@ -571,6 +584,7 @@ func (e *bestFastEncoder) Reset(d *dict, singleBlock bool) {
 	resetDirtyShards(e.table[:], e.dictTable, e.tableShardDirty[:], e.allDirty)
 	resetDirtyShards(e.longTable[:], e.dictLongTable, e.longTableShardDirty[:], e.allDirty)
 	e.allDirty = false
+	e.markDirty = true
 	e.cur = e.maxMatchOff
 }
 
