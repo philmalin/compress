@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1247,4 +1248,143 @@ func TestEncoderChooseCompWithDictTables(t *testing.T) {
 			}
 		})
 	}
+}
+
+// dictReuseInputs returns the dictionaries of dict-tests-small.zip and 31
+// inputs: 15 small, one of 2 MiB, and 15 small.
+func dictReuseInputs(t *testing.T) (dicts, inputs [][]byte) {
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
+	readFile := func(f *zip.File) []byte {
+		r, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		b, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	var zsts []*zip.File
+	for _, f := range zr.File {
+		switch {
+		case strings.HasSuffix(f.Name, ".dict"):
+			dicts = append(dicts, readFile(f))
+		case strings.HasSuffix(f.Name, ".zst"):
+			zsts = append(zsts, f)
+		}
+	}
+	dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDicts(dicts...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	var all []byte
+	for _, f := range zsts {
+		decoded, err := dec.DecodeAll(readFile(f), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, decoded...)
+		if len(inputs) < 30 && len(decoded) < 64<<10 {
+			inputs = append(inputs, decoded)
+		}
+	}
+	if len(inputs) < 30 {
+		t.Fatalf("found %d inputs, want 30", len(inputs))
+	}
+	large := all[:min(len(all), 2<<20)]
+	return dicts, append(inputs[:15:15], append([][]byte{large}, inputs[15:]...)...)
+}
+
+// TestEncoderDictReuseMatchesFresh verifies that an encoder reused across
+// inputs gives the same output as a fresh encoder with the same dictionary.
+func TestEncoderDictReuseMatchesFresh(t *testing.T) {
+	dicts, inputs := dictReuseInputs(t)
+	dictOpts := map[string]EOption{
+		"trained": WithEncoderDict(dicts[0]),
+		"raw":     WithEncoderDictRaw(1234, dicts[0]),
+	}
+	for level := SpeedFastest; level < speedLast; level++ {
+		if isRaceTest && level >= SpeedBestCompression {
+			break
+		}
+		for name, dictOpt := range dictOpts {
+			t.Run(fmt.Sprint(level, "-", name), func(t *testing.T) {
+				newEnc := func() *Encoder {
+					enc, err := NewWriter(nil, WithEncoderConcurrency(1), WithEncoderLevel(level), dictOpt)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return enc
+				}
+				reused := newEnc()
+				defer reused.Close()
+				var got, want []byte
+				for i, in := range inputs {
+					got = reused.EncodeAll(in, got[:0])
+					fresh := newEnc()
+					want = fresh.EncodeAll(in, want[:0])
+					fresh.Close()
+					if !bytes.Equal(got, want) {
+						t.Fatalf("input %d (%d bytes): reused encoder gave %d bytes, fresh encoder %d bytes", i, len(in), len(got), len(want))
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestBestEncoderDictResetRestoresTables verifies that Reset with a
+// dictionary puts both match tables back to the dictionary tables, after
+// inputs that write to some shards (the small ones) or to most of them (the
+// large one), and after ResetPrefix. A stale entry still gives valid
+// output, so the output alone rarely shows it.
+func TestBestEncoderDictResetRestoresTables(t *testing.T) {
+	if isRaceTest {
+		t.Skip("allocates the tables of the best encoder")
+	}
+	dicts, inputs := dictReuseInputs(t)
+	d, err := loadDict(dicts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	const window = 1 << 20
+	e := &bestFastEncoder{fastBase: fastBase{maxMatchOff: window, bufferReset: math.MaxInt32 - window*2}}
+	check := func(after string) {
+		t.Helper()
+		e.Reset(d, false)
+		if !slices.Equal(e.table[:], e.dictTable) {
+			t.Fatalf("after %s: the short table differs from the dictionary table", after)
+		}
+		if !slices.Equal(e.longTable[:], e.dictLongTable) {
+			t.Fatalf("after %s: the long table differs from the dictionary table", after)
+		}
+	}
+	encode := func(in []byte) {
+		blk := e.Block()
+		for len(in) > 0 {
+			todo := in[:min(len(in), maxCompressedBlockSize)]
+			in = in[len(todo):]
+			blk.pushOffsets()
+			e.Encode(blk, todo)
+			blk.reset(nil)
+		}
+	}
+	check("the first Reset")
+	for i, in := range inputs {
+		encode(in)
+		check(fmt.Sprintf("input %d", i))
+	}
+	e.ResetPrefix(inputs[0])
+	check("ResetPrefix")
+
+	// Reset without a dictionary moves e.cur on and keeps the tables. Then a
+	// low bufferReset makes a small input rebase the tables (the e.cur
+	// wraparound), which moves every entry.
+	e.Reset(nil, false)
+	e.bufferReset = e.cur
+	encode(inputs[0])
+	check("a rebase of the tables")
 }

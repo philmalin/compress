@@ -24,6 +24,9 @@ const (
 	bestShortTableSize = 1 << bestShortTableBits // Size of the table
 	bestShortLen       = 4                       // Bytes used for table hash
 
+	bestLongTableShardCnt  = 1 << (bestLongTableBits - dictShardBits)  // Number of shards in the table
+	bestShortTableShardCnt = 1 << (bestShortTableBits - dictShardBits) // Number of shards in the table
+
 )
 
 type match struct {
@@ -72,6 +75,12 @@ type bestFastEncoder struct {
 	longTable     [bestLongTableSize]prevEntry
 	dictTable     []prevEntry
 	dictLongTable []prevEntry
+
+	// Shards of the tables written since the last Reset with a dictionary.
+	// Reset copies back only these from the dictionary tables.
+	tableShardDirty     [bestShortTableShardCnt]bool
+	longTableShardDirty [bestLongTableShardCnt]bool
+	allDirty            bool
 }
 
 // Encode improves compression...
@@ -85,6 +94,7 @@ func (e *bestFastEncoder) Encode(blk *blockEnc, src []byte) {
 
 	// Protect against e.cur wraparound.
 	for e.cur >= e.bufferReset-int32(len(e.hist)) {
+		e.allDirty = true
 		if len(e.hist) == 0 {
 			e.table = [bestShortTableSize]prevEntry{}
 			e.longTable = [bestLongTableSize]prevEntry{}
@@ -289,7 +299,9 @@ encodeLoop:
 		}
 		// Load next and check...
 		e.longTable[nextHashL] = prevEntry{offset: s + e.cur, prev: candidateL.offset}
+		e.longTableShardDirty[nextHashL>>dictShardBits] = true
 		e.table[nextHashS] = prevEntry{offset: s + e.cur, prev: candidateS.offset}
+		e.tableShardDirty[nextHashS>>dictShardBits] = true
 		index0 := s + 1
 
 		// Look far ahead, unless we have a really long match already...
@@ -384,7 +396,9 @@ encodeLoop:
 				h0 := hashLen(cv0, bestLongTableBits, bestLongLen)
 				h1 := hashLen(cv0, bestShortTableBits, bestShortLen)
 				e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
+				e.longTableShardDirty[h0>>dictShardBits] = true
 				e.table[h1] = prevEntry{offset: off, prev: e.table[h1].offset}
+				e.tableShardDirty[h1>>dictShardBits] = true
 				off++
 				index0++
 			}
@@ -444,7 +458,9 @@ encodeLoop:
 			h0 := hashLen(cv0, bestLongTableBits, bestLongLen)
 			h1 := hashLen(cv0, bestShortTableBits, bestShortLen)
 			e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
+			e.longTableShardDirty[h0>>dictShardBits] = true
 			e.table[h1] = prevEntry{offset: off, prev: e.table[h1].offset}
+			e.tableShardDirty[h1>>dictShardBits] = true
 			index0++
 			off++
 		}
@@ -543,13 +559,41 @@ func (e *bestFastEncoder) Reset(d *dict, singleBlock bool) {
 			}
 		}
 	}
+	if dictChanged {
+		e.allDirty = true
+	}
 	e.lastDict = d
-	// Reset table to initial state
-	copy(e.longTable[:], e.dictLongTable)
-
+	// Reset tables to initial state
+	resetDirtyShards(e.table[:], e.dictTable, e.tableShardDirty[:], e.allDirty)
+	resetDirtyShards(e.longTable[:], e.dictLongTable, e.longTableShardDirty[:], e.allDirty)
+	e.allDirty = false
 	e.cur = e.maxMatchOff
-	// Reset table to initial state
-	copy(e.table[:], e.dictTable)
+}
+
+// resetDirtyShards copies the dirty shards of src to dst, or all of src when
+// most shards are dirty, and clears dirty.
+func resetDirtyShards(dst, src []prevEntry, dirty []bool, all bool) {
+	if !all {
+		n := 0
+		for _, d := range dirty {
+			if d {
+				n++
+			}
+		}
+		all = n > len(dirty)*4/6
+	}
+	if all {
+		copy(dst, src)
+		clear(dirty)
+		return
+	}
+	const shardSize = 1 << dictShardBits
+	for i, d := range dirty {
+		if d {
+			copy(dst[i*shardSize:(i+1)*shardSize], src[i*shardSize:(i+1)*shardSize])
+			dirty[i] = false
+		}
+	}
 }
 
 func (e *bestFastEncoder) ResetPrefix(prefix []byte) {
@@ -557,6 +601,7 @@ func (e *bestFastEncoder) ResetPrefix(prefix []byte) {
 	if len(prefix) < 8 {
 		return
 	}
+	e.allDirty = true
 	end := e.cur + int32(len(prefix)) - 8
 	for i := e.cur; i < end; i++ {
 		cv := load6432(prefix, i-e.cur)
