@@ -1380,6 +1380,11 @@ func TestBestEncoderDictResetRestoresTables(t *testing.T) {
 	e.ResetPrefix(inputs[0])
 	check("ResetPrefix")
 
+	// Encode does not mark the shards after a Reset without a dictionary.
+	e.Reset(nil, false)
+	encode(inputs[0])
+	check("an encode without a dictionary")
+
 	// Reset without a dictionary moves e.cur on and keeps the tables. Then a
 	// low bufferReset makes a small input rebase the tables (the e.cur
 	// wraparound), which moves every entry.
