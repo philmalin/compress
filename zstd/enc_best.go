@@ -7,6 +7,7 @@ package zstd
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 
 	"github.com/klauspost/compress"
 )
@@ -24,8 +25,12 @@ const (
 	bestShortTableSize = 1 << bestShortTableBits // Size of the table
 	bestShortLen       = 4                       // Bytes used for table hash
 
-	bestLongTableShardCnt  = 1 << (bestLongTableBits - dictShardBits)  // Number of shards in the table
-	bestShortTableShardCnt = 1 << (bestShortTableBits - dictShardBits) // Number of shards in the table
+	// Shards of the tables for the reset with a dictionary. They are small,
+	// as a small input writes to few entries of each shard, and Reset copies
+	// a full shard for each entry written.
+	bestShardBits          = 4                                         // 16 entries in a shard
+	bestLongTableShardCnt  = 1 << (bestLongTableBits - bestShardBits)  // Number of shards in the table
+	bestShortTableShardCnt = 1 << (bestShortTableBits - bestShardBits) // Number of shards in the table
 
 )
 
@@ -76,12 +81,13 @@ type bestFastEncoder struct {
 	dictTable     []prevEntry
 	dictLongTable []prevEntry
 
-	// Shards of the tables written since the last Reset with a dictionary.
+	// Shards of the tables written since the last Reset with a dictionary, one
+	// bit for each shard.
 	// Reset copies back only these from the dictionary tables.
 	// Encode marks them only when markDirty is set, that is, after a Reset
 	// with a dictionary. Other writes make Reset copy all (allDirty).
-	tableShardDirty     [bestShortTableShardCnt]bool
-	longTableShardDirty [bestLongTableShardCnt]bool
+	tableShardDirty     [bestShortTableShardCnt / 64]uint64
+	longTableShardDirty [bestLongTableShardCnt / 64]uint64
 	allDirty            bool
 	markDirty           bool
 }
@@ -306,8 +312,8 @@ encodeLoop:
 		e.longTable[nextHashL] = prevEntry{offset: s + e.cur, prev: candidateL.offset}
 		e.table[nextHashS] = prevEntry{offset: s + e.cur, prev: candidateS.offset}
 		if markDirty {
-			e.longTableShardDirty[nextHashL>>dictShardBits] = true
-			e.tableShardDirty[nextHashS>>dictShardBits] = true
+			markShard(e.longTableShardDirty[:], nextHashL>>bestShardBits)
+			markShard(e.tableShardDirty[:], nextHashS>>bestShardBits)
 		}
 		index0 := s + 1
 
@@ -405,8 +411,8 @@ encodeLoop:
 				e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
 				e.table[h1] = prevEntry{offset: off, prev: e.table[h1].offset}
 				if markDirty {
-					e.longTableShardDirty[h0>>dictShardBits] = true
-					e.tableShardDirty[h1>>dictShardBits] = true
+					markShard(e.longTableShardDirty[:], h0>>bestShardBits)
+					markShard(e.tableShardDirty[:], h1>>bestShardBits)
 				}
 				off++
 				index0++
@@ -469,8 +475,8 @@ encodeLoop:
 			e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
 			e.table[h1] = prevEntry{offset: off, prev: e.table[h1].offset}
 			if markDirty {
-				e.longTableShardDirty[h0>>dictShardBits] = true
-				e.tableShardDirty[h1>>dictShardBits] = true
+				markShard(e.longTableShardDirty[:], h0>>bestShardBits)
+				markShard(e.tableShardDirty[:], h1>>bestShardBits)
 			}
 			index0++
 			off++
@@ -584,29 +590,35 @@ func (e *bestFastEncoder) Reset(d *dict, singleBlock bool) {
 	e.cur = e.maxMatchOff
 }
 
+// markShard sets the bit of shard i in dirty.
+func markShard(dirty []uint64, i uint32) {
+	dirty[i/64] |= 1 << (i % 64)
+}
+
 // resetDirtyShards copies the dirty shards of src to dst, or all of src when
-// most shards are dirty, and clears dirty.
-func resetDirtyShards(dst, src []prevEntry, dirty []bool, all bool) {
+// most shards are dirty, and clears dirty. dirty has one bit for each shard.
+func resetDirtyShards(dst, src []prevEntry, dirty []uint64, all bool) {
+	shards := len(dirty) * 64
 	if !all {
 		n := 0
-		for _, d := range dirty {
-			if d {
-				n++
-			}
+		for _, w := range dirty {
+			n += bits.OnesCount64(w)
 		}
-		all = n > len(dirty)*4/6
+		all = n > shards*4/6
 	}
 	if all {
 		copy(dst, src)
 		clear(dirty)
 		return
 	}
-	const shardSize = 1 << dictShardBits
-	for i, d := range dirty {
-		if d {
-			copy(dst[i*shardSize:(i+1)*shardSize], src[i*shardSize:(i+1)*shardSize])
-			dirty[i] = false
+	shardSize := len(dst) / shards
+	for i, w := range dirty {
+		for w != 0 {
+			j := (i*64 + bits.TrailingZeros64(w)) * shardSize
+			copy(dst[j:j+shardSize], src[j:j+shardSize])
+			w &= w - 1
 		}
+		dirty[i] = 0
 	}
 }
 
