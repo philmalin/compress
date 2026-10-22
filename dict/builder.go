@@ -154,6 +154,13 @@ func buildDict(input [][]byte, o Options) ([]byte, error) {
 		// Happens with a single input, or inputs that are identical or share nothing.
 		return nil, fmt.Errorf("no content is repeated more than average across inputs")
 	}
+	// The order of a map changes from run to run, and the comparison below
+	// is not a strict order, so its result depends on the order it starts
+	// from. Start from the order of the hashes, so the same input always
+	// gives the same dictionary.
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].hash < sorted[j].hash
+	})
 	sort.Slice(sorted, func(i, j int) bool {
 		if true {
 			// Group very similar counts together and emit low offsets first.
@@ -263,6 +270,10 @@ func buildDict(input [][]byte, o Options) ([]byte, error) {
 			}
 			if len(sortedPrev) > 0 {
 				sort.Slice(sortedPrev, func(i, j int) bool {
+					if sortedPrev[i].n == sortedPrev[j].n {
+						// Break ties by hash, not by the order of the map.
+						return sortedPrev[i].hash < sortedPrev[j].hash
+					}
 					return sortedPrev[i].n > sortedPrev[j].n
 				})
 				bestPrev := output[sortedPrev[0].hash]
@@ -322,6 +333,10 @@ func buildDict(input [][]byte, o Options) ([]byte, error) {
 				}
 				sort.Slice(sortedFollow, func(i, j int) bool {
 					if sortedFollow[i].n == sortedFollow[j].n {
+						if sortedFollow[i].offset == sortedFollow[j].offset {
+							// Break ties by hash, not by the order of the map.
+							return sortedFollow[i].hash < sortedFollow[j].hash
+						}
 						return sortedFollow[i].offset > sortedFollow[j].offset
 					}
 					return sortedFollow[i].n > sortedFollow[j].n
