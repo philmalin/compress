@@ -148,3 +148,51 @@ func TestBuildDictInvalidInput(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildDictDeterministic builds each kind of dictionary several times
+// from the same input, and checks that each build gives the same bytes.
+// The builder collects its candidates from maps, whose order changes from
+// run to run, so every choice must be independent of that order.
+func TestBuildDictDeterministic(t *testing.T) {
+	var samples [][]byte
+	for _, name := range []string{"html.txt", "Mark.Twain-Tom.Sawyer.txt"} {
+		b, err := os.ReadFile("../testdata/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b = b[:min(len(b), 64<<10)]
+		// Pieces of different sizes, which share text.
+		for i := 0; len(b) > 0; i++ {
+			n := min(len(b), 1000+(i%7)*300)
+			samples = append(samples, b[:n])
+			b = b[n:]
+		}
+	}
+	builders := []struct {
+		name  string
+		build func([][]byte, Options) ([]byte, error)
+	}{
+		{"raw", BuildRawDict},
+		{"s2", BuildS2Dict},
+		{"zstd", BuildZstdDict},
+	}
+	for _, b := range builders {
+		for _, size := range []int{2048, 8192, 32768} {
+			o := Options{MaxDictSize: size, HashBytes: 6, ZstdDictID: 1234, ZstdLevel: zstd.SpeedBestCompression}
+			first, err := b.build(samples, o)
+			if err != nil {
+				t.Fatalf("%s, %d: %v", b.name, size, err)
+			}
+			for run := 1; run < 4; run++ {
+				got, err := b.build(samples, o)
+				if err != nil {
+					t.Fatalf("%s, %d: %v", b.name, size, err)
+				}
+				if !bytes.Equal(got, first) {
+					t.Errorf("%s, %d bytes: build %d differs from the first build", b.name, size, run+1)
+					break
+				}
+			}
+		}
+	}
+}
